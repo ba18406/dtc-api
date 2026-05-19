@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from fastapi import UploadFile, File, Form
 import os
 import shutil
+from fastapi import HTTPException
 from fastapi.responses import FileResponse
 
 app = FastAPI()
@@ -631,23 +632,26 @@ def download_file_api(file_id: int):
     conn = get_connection()
     cur = conn.cursor()
 
-    cur.execute("SELECT file_path, file_name FROM files WHERE id = %s", (file_id,))
+    cur.execute(
+        "SELECT file_path, file_name FROM files WHERE id = %s",
+        (file_id,)
+    )
+
     row = cur.fetchone()
 
     cur.close()
     conn.close()
 
     if not row:
-        return {"success": False, "error": "File not found in database"}
+        raise HTTPException(status_code=404, detail="File not found in database")
 
     file_path, file_name = row
 
     if not os.path.exists(file_path):
-        return {"success": False, "error": "File missing on server"}
+        raise HTTPException(status_code=404, detail="File missing on server")
 
     return FileResponse(
-        file_path,
+        path=file_path,
         filename=file_name,
         media_type="application/octet-stream"
     )
-
