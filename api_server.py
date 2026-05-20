@@ -6,8 +6,16 @@ import os
 import shutil
 from fastapi import HTTPException
 from fastapi.responses import FileResponse
+from supabase import create_client
+import uuid
+from fastapi.responses import Response
 
 app = FastAPI()
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "dtc-files")
+
+supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 # DATABASE CONNECTION
 def get_connection():
@@ -593,15 +601,16 @@ def upload_file_api(
     file: UploadFile = File(...)
 ):
     try:
-        if not os.path.exists(UPLOAD_FOLDER):
-            os.makedirs(UPLOAD_FOLDER)
-
         file_name = file.filename
         file_type = os.path.splitext(file_name)[1].lower()
-        save_path = os.path.abspath(os.path.join(UPLOAD_FOLDER, file_name))
 
-        with open(save_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        storage_path = f"{uploaded_by}/{uuid.uuid4()}_{file_name}"
+        file_bytes = file.file.read()
+
+        supabase.storage.from_(SUPABASE_BUCKET).upload(
+            storage_path,
+            file_bytes
+        )
 
         conn = get_connection()
         cur = conn.cursor()
@@ -609,7 +618,7 @@ def upload_file_api(
         cur.execute("""
             INSERT INTO files (file_name, file_type, file_path, uploaded_by)
             VALUES (%s, %s, %s, %s)
-        """, (file_name, file_type, save_path, uploaded_by))
+        """, (file_name, file_type, storage_path, uploaded_by))
 
         conn.commit()
         cur.close()
@@ -626,7 +635,7 @@ def upload_file_api(
             "success": False,
             "error": str(e)
         }
-
+        
 @app.get("/files/download/{file_id}")
 def download_file_api(file_id: int):
     conn = get_connection()
@@ -645,13 +654,19 @@ def download_file_api(file_id: int):
     if not row:
         raise HTTPException(status_code=404, detail="File not found in database")
 
-    file_path, file_name = row
+    storage_path, file_name = row
 
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File missing on server")
+    try:
+        file_bytes = supabase.storage.from_(SUPABASE_BUCKET).download(storage_path)
 
-    return FileResponse(
-        path=file_path,
-        filename=file_name,
-        media_type="application/octet-stream"
-    )
+        return Response(
+            content=file_bytes,
+            media_type="application/octet-stream",
+            headers={
+                "Content-Disposition": f'attachment; filename="{file_name}"'
+            }
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
+        
