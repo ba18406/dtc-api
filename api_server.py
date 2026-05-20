@@ -9,6 +9,7 @@ from fastapi.responses import FileResponse
 from supabase import create_client
 import uuid
 from fastapi.responses import Response
+from urllib.parse import quote
 
 app = FastAPI()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -659,13 +660,15 @@ def download_file_api(file_id: int):
     try:
         file_bytes = supabase.storage.from_(SUPABASE_BUCKET).download(storage_path)
 
-        return Response(
-            content=file_bytes,
-            media_type="application/octet-stream",
-            headers={
-                "Content-Disposition": f'attachment; filename="{file_name}"'
-            }
-        )
+    safe_filename = quote(file_name)
+    
+    return Response(
+        content=file_bytes,
+        media_type="application/octet-stream",
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{safe_filename}"
+        }
+    )
 
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e))
