@@ -604,7 +604,7 @@ def upload_file_api(
         file_name = file.filename
         file_type = os.path.splitext(file_name)[1].lower()
 
-        storage_path = f"{uploaded_by}/{uuid.uuid4()}_{file_name}"
+        storage_path = f"{uploaded_by}/{uuid.uuid4().hex}{file_type}"
         file_bytes = file.file.read()
 
         supabase.storage.from_(SUPABASE_BUCKET).upload(
