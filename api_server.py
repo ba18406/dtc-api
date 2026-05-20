@@ -660,15 +660,15 @@ def download_file_api(file_id: int):
     try:
         file_bytes = supabase.storage.from_(SUPABASE_BUCKET).download(storage_path)
 
-    safe_filename = quote(file_name)
-    
-    return Response(
-        content=file_bytes,
-        media_type="application/octet-stream",
-        headers={
-            "Content-Disposition": f"attachment; filename*=UTF-8''{safe_filename}"
-        }
-    )
+        safe_filename = quote(file_name)
+        
+        return Response(
+            content=file_bytes,
+            media_type="application/octet-stream",
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{safe_filename}"
+            }
+        )
 
     except Exception as e:
         raise HTTPException(status_code=404, detail=str(e))
