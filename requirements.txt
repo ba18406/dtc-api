@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+psycopg2-binary
+python-multipart
+supabase
+requests
+pandas
+openpyxl
+python-docx
+pillow
+PyMuPDF
