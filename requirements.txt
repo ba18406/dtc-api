@@ -10,3 +10,6 @@ python-docx
 pillow
 PyMuPDF
 python-dotenv
+msal
+PyJWT
+cryptography
