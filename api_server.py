@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends, Request
 import psycopg2
 from pydantic import BaseModel
 from fastapi import UploadFile, File, Form
@@ -13,6 +13,17 @@ from supabase import create_client
 from dotenv import load_dotenv
 import os
 from fastapi.middleware.cors import CORSMiddleware
+import base64
+import json
+import secrets
+from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
+
+import jwt
+import msal
+import requests
+from cryptography.fernet import Fernet
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 load_dotenv()
 
@@ -41,13 +52,10 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # DATABASE CONNECTION
 def get_connection():
-    return psycopg2.connect(
-        host="aws-1-ap-south-1.pooler.supabase.com",
-        port="5432",
-        dbname="postgres",
-        user="postgres.dlqfrjjnkdtphjgdynpt",
-        password="Bnh@99272700"
-    )
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        raise RuntimeError("DATABASE_URL is required")
+    return psycopg2.connect(database_url, sslmode=os.getenv("DATABASE_SSLMODE", "require"))
 
 def init_database():
     conn = get_connection()
@@ -90,17 +98,154 @@ def init_database():
         );
     """)
 
-    cur.execute("""
-        INSERT INTO users (username, password, full_name, role)
-        VALUES ('admin', '1234', 'System Admin', 'admin')
-        ON CONFLICT (username) DO NOTHING;
-    """)
+    bootstrap_username = os.getenv("DTC_BOOTSTRAP_ADMIN_USERNAME")
+    bootstrap_password = os.getenv("DTC_BOOTSTRAP_ADMIN_PASSWORD")
+    if bootstrap_username and bootstrap_password:
+        cur.execute("""
+            INSERT INTO users (username, password, full_name, role)
+            VALUES (%s, %s, %s, 'admin')
+            ON CONFLICT (username) DO NOTHING;
+        """, (bootstrap_username, bootstrap_password,
+              os.getenv("DTC_BOOTSTRAP_ADMIN_NAME", "DTC Administrator")))
 
     conn.commit()
     cur.close()
     conn.close()
 
 init_database()
+
+# Microsoft Graph configuration and server-side delegated token storage.
+GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+GRAPH_SCOPES = ["https://graph.microsoft.com/Files.ReadWrite"]
+security = HTTPBearer(auto_error=False)
+
+def _jwt_key():
+    key = os.getenv("DTC_JWT_SECRET")
+    if not key:
+        raise HTTPException(status_code=503, detail="DTC_JWT_SECRET is not configured")
+    return key
+
+def _fernet():
+    key = os.getenv("EXCEL_TOKEN_ENCRYPTION_KEY")
+    if not key:
+        raise HTTPException(status_code=503, detail="Excel token encryption is not configured")
+    try:
+        return Fernet(key.encode("ascii"))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Invalid Excel token encryption key") from exc
+
+def _msal_app(cache=None):
+    client_id = os.getenv("MS_CLIENT_ID")
+    client_secret = os.getenv("MS_CLIENT_SECRET")
+    tenant_id = os.getenv("MS_TENANT_ID")
+    if not all((client_id, client_secret, tenant_id)):
+        raise HTTPException(status_code=503, detail="Microsoft Entra app settings are incomplete")
+    return msal.ConfidentialClientApplication(
+        client_id,
+        authority=f"https://login.microsoftonline.com/{tenant_id}",
+        client_credential=client_secret,
+        token_cache=cache,
+    )
+
+def _load_token_cache():
+    cache = msal.SerializableTokenCache()
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT encrypted_cache FROM excel_token_cache WHERE id = 1")
+            row = cur.fetchone()
+        if row:
+            cache.deserialize(_fernet().decrypt(bytes(row[0])).decode("utf-8"))
+        return cache
+    finally:
+        conn.close()
+
+def _save_token_cache(cache):
+    encrypted = _fernet().encrypt(cache.serialize().encode("utf-8"))
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO excel_token_cache (id, encrypted_cache, updated_at)
+                VALUES (1, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT (id) DO UPDATE SET
+                    encrypted_cache = EXCLUDED.encrypted_cache,
+                    updated_at = CURRENT_TIMESTAMP
+            """, (encrypted,))
+        conn.commit()
+    finally:
+        conn.close()
+
+def _get_graph_token():
+    cache = _load_token_cache()
+    app_msal = _msal_app(cache)
+    accounts = app_msal.get_accounts()
+    result = app_msal.acquire_token_silent(GRAPH_SCOPES, account=accounts[0]) if accounts else None
+    if cache.has_state_changed:
+        _save_token_cache(cache)
+    if not result or "access_token" not in result:
+        raise HTTPException(status_code=503, detail="Microsoft workbook is not connected; an administrator must connect it")
+    return result["access_token"]
+
+def _graph_item_path():
+    share_url = os.getenv("GRAPH_WORKBOOK_SHARE_URL")
+    if not share_url:
+        raise HTTPException(status_code=503, detail="GRAPH_WORKBOOK_SHARE_URL is not configured")
+    share_id = "u!" + base64.urlsafe_b64encode(share_url.encode("utf-8")).decode("ascii").rstrip("=")
+    return f"shares/{share_id}/driveItem/workbook"
+
+def _graph(method, path, payload=None, params=None, session_id=None):
+    headers = {"Authorization": f"Bearer {_get_graph_token()}", "Accept": "application/json"}
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    if session_id:
+        headers["workbook-session-id"] = session_id
+    response = requests.request(method, f"{GRAPH_BASE}/{path.lstrip('/')}", headers=headers,
+                                json=payload, params=params, timeout=45)
+    if response.status_code >= 400:
+        # Avoid returning response bodies that can contain tenant or workbook details.
+        raise HTTPException(status_code=502, detail=f"Microsoft Graph request failed ({response.status_code})")
+    return response.json() if response.content else {}
+
+def _require_dtc_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if not credentials:
+        raise HTTPException(status_code=401, detail="DTC sign-in required")
+    try:
+        claims = jwt.decode(credentials.credentials, _jwt_key(), algorithms=["HS256"])
+        if not isinstance(claims.get("id"), int) or claims.get("role") not in {"admin", "supervisor", "user"}:
+            raise ValueError("invalid claims")
+        return claims
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="Invalid or expired DTC session") from exc
+
+def _require_admin(user=Depends(_require_dtc_user)):
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Administrator access required")
+    return user
+
+def _init_excel_auth_tables():
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS excel_token_cache (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    encrypted_cache BYTEA NOT NULL,
+                    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS excel_oauth_flows (
+                    state VARCHAR(128) PRIMARY KEY,
+                    flow_json TEXT NOT NULL,
+                    expires_at TIMESTAMP NOT NULL
+                )
+            """)
+        conn.commit()
+    finally:
+        conn.close()
+
+_init_excel_auth_tables()
 
 class LoginRequest(BaseModel):
     username: str
@@ -137,9 +282,21 @@ def login(data: LoginRequest):
         conn.close()
 
         if user:
+            session_token = jwt.encode(
+                {
+                    "id": int(user[0]),
+                    "username": user[1],
+                    "role": user[3],
+                    "exp": datetime.now(timezone.utc) + timedelta(hours=8),
+                    "iat": datetime.now(timezone.utc),
+                },
+                _jwt_key(),
+                algorithm="HS256",
+            )
             return {
                 "success": True,
                 "message": "Login successful",
+                "access_token": session_token,
                 "user": {
                     "id": user[0],
                     "username": user[1],
@@ -158,6 +315,150 @@ def login(data: LoginRequest):
             "success": False,
             "error": str(e)
         }
+
+
+@app.post("/excel/connect-url")
+def excel_connect_url(_admin=Depends(_require_admin)):
+    """Start the one-time delegated Microsoft sign-in in an administrator's browser."""
+    redirect_uri = os.getenv("MS_REDIRECT_URI")
+    if not redirect_uri:
+        raise HTTPException(status_code=503, detail="MS_REDIRECT_URI is not configured")
+    state = secrets.token_urlsafe(32)
+    flow = _msal_app().initiate_auth_code_flow(
+        scopes=GRAPH_SCOPES,
+        redirect_uri=redirect_uri,
+        state=state,
+    )
+    if "auth_uri" not in flow:
+        raise HTTPException(status_code=503, detail="Could not start Microsoft sign-in")
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM excel_oauth_flows WHERE expires_at < CURRENT_TIMESTAMP")
+            cur.execute("INSERT INTO excel_oauth_flows (state, flow_json, expires_at) VALUES (%s, %s, %s)",
+                        (state, json.dumps(flow), datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=10)))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"authorization_url": flow["auth_uri"]}
+
+
+@app.get("/excel/oauth/callback")
+def excel_oauth_callback(request: Request, code: str | None = None, state: str | None = None,
+                         error: str | None = None, error_description: str | None = None):
+    if error:
+        return {"success": False, "message": "Microsoft sign-in was not completed"}
+    if not code or not state:
+        raise HTTPException(status_code=400, detail="Missing Microsoft sign-in response")
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT flow_json FROM excel_oauth_flows WHERE state = %s AND expires_at > CURRENT_TIMESTAMP", (state,))
+            row = cur.fetchone()
+            if row:
+                cur.execute("DELETE FROM excel_oauth_flows WHERE state = %s", (state,))
+        conn.commit()
+    finally:
+        conn.close()
+    if not row:
+        raise HTTPException(status_code=400, detail="Microsoft sign-in expired; start again from DTC")
+    flow = json.loads(row[0])
+    cache = msal.SerializableTokenCache()
+    result = _msal_app(cache).acquire_token_by_auth_code_flow(flow, dict(request.query_params))
+    if "access_token" not in result:
+        raise HTTPException(status_code=401, detail="Microsoft sign-in failed")
+    allowed_account = (os.getenv("MS_ALLOWED_USER") or "").strip().casefold()
+    claims = result.get("id_token_claims") or {}
+    signed_in_account = (claims.get("preferred_username") or claims.get("email") or "").strip().casefold()
+    if not allowed_account or signed_in_account != allowed_account:
+        raise HTTPException(status_code=403, detail="This Microsoft account is not allowed to connect the workbook")
+    _save_token_cache(cache)
+    return {"success": True, "message": "Microsoft workbook connection completed. You may return to DTC."}
+
+
+@app.get("/excel/status")
+def excel_status(_user=Depends(_require_dtc_user)):
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT updated_at FROM excel_token_cache WHERE id = 1")
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    return {"connected": bool(row), "connected_at": str(row[0]) if row else None}
+
+
+@app.get("/excel/tables")
+def excel_tables(_user=Depends(_require_dtc_user)):
+    result = _graph("GET", f"{_graph_item_path()}/tables", params={"$select": "id,name,showHeaders,showTotals"})
+    return {"tables": result.get("value", [])}
+
+
+@app.get("/excel/tables/{table_id}/rows")
+def excel_rows(table_id: str, skip: int = 0, top: int = 100, _user=Depends(_require_dtc_user)):
+    if skip < 0 or top < 1 or top > 500:
+        raise HTTPException(status_code=400, detail="Invalid page size")
+    path = f"{_graph_item_path()}/tables/{quote(table_id, safe='')}/rows"
+    result = _graph("GET", path, params={"$top": top, "$skip": skip})
+    return {"rows": result.get("value", []), "next_link": result.get("@odata.nextLink")}
+
+@app.get("/excel/tables/{table_id}/columns")
+def excel_columns(table_id: str, _user=Depends(_require_dtc_user)):
+    result = _graph("GET", f"{_graph_item_path()}/tables/{quote(table_id, safe='')}/columns")
+    return {"columns": result.get("value", [])}
+
+
+def _open_workbook_session():
+    return _graph("POST", f"{_graph_item_path()}/createSession", {"persistChanges": True}).get("id")
+
+def _close_workbook_session(session_id):
+    if session_id:
+        try:
+            _graph("POST", f"{_graph_item_path()}/closeSession", {}, session_id=session_id)
+        except HTTPException:
+            pass
+
+class ExcelRowUpdate(BaseModel):
+    values: list[list[object]]
+
+class ExcelRowAdd(BaseModel):
+    values: list[list[object]]
+
+@app.patch("/excel/tables/{table_id}/rows/{row_index}")
+def excel_update_row(table_id: str, row_index: int, data: ExcelRowUpdate, _admin=Depends(_require_admin)):
+    if row_index < 0 or len(data.values) != 1:
+        raise HTTPException(status_code=400, detail="Provide one row and a valid row index")
+    session_id = _open_workbook_session()
+    try:
+        result = _graph("PATCH", f"{_graph_item_path()}/tables/{quote(table_id, safe='')}/rows/{row_index}",
+                        {"values": data.values}, session_id=session_id)
+        return {"success": True, "row": result}
+    finally:
+        _close_workbook_session(session_id)
+
+@app.post("/excel/tables/{table_id}/rows")
+def excel_add_row(table_id: str, data: ExcelRowAdd, _admin=Depends(_require_admin)):
+    if len(data.values) != 1:
+        raise HTTPException(status_code=400, detail="Provide exactly one row")
+    session_id = _open_workbook_session()
+    try:
+        result = _graph("POST", f"{_graph_item_path()}/tables/{quote(table_id, safe='')}/rows/add",
+                        {"index": None, "values": data.values}, session_id=session_id)
+        return {"success": True, "row": result}
+    finally:
+        _close_workbook_session(session_id)
+
+@app.delete("/excel/tables/{table_id}/rows/{row_index}")
+def excel_delete_row(table_id: str, row_index: int, _admin=Depends(_require_admin)):
+    if row_index < 0:
+        raise HTTPException(status_code=400, detail="Invalid row index")
+    session_id = _open_workbook_session()
+    try:
+        _graph("DELETE", f"{_graph_item_path()}/tables/{quote(table_id, safe='')}/rows/{row_index}",
+               session_id=session_id)
+        return {"success": True}
+    finally:
+        _close_workbook_session(session_id)
 
 @app.get("/users/visible/{user_id}/{role}")
 def get_visible_users_api(user_id: int, role: str):
